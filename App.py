@@ -13,10 +13,15 @@ st.set_page_config(page_title="Personal Intelligence", layout="wide", page_icon=
 @st.cache_resource
 def get_db():
     try:
+        if "firebase" not in st.secrets:
+            st.error("Secrets 'firebase' nicht gefunden. Bitte in Streamlit Cloud unter Settings -> Secrets hinterlegen.")
+            return None
+        
         key_dict = dict(st.secrets["firebase"])
-        # Bereinigung des Private Keys (wichtig für Streamlit Cloud)
+        # Bereinigung des Private Keys (wichtig für Streamlit Cloud Hosting)
         if "private_key" in key_dict:
             key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+            
         creds = service_account.Credentials.from_service_account_info(key_dict)
         return firestore.Client(credentials=creds, project=key_dict["project_id"])
     except Exception as e:
@@ -27,93 +32,66 @@ db = get_db()
 
 # --- HILFSFUNKTIONEN ---
 def extract_tags(text):
-    if not isinstance(text, str): return ""
+    """Extrahiert einfache Schlagworte aus Nachrichtentexten"""
+    if not isinstance(text, str) or len(text) < 5: return ""
+    # Findet Worte, die mit Großbuchstaben beginnen (Eigennamen/Nomen)
     words = re.findall(r'\b[A-Z][a-z]{4,}\b', text)
-    return ", ".join(list(set(words))[:3])
+    unique_tags = list(set(words))
+    return ", ".join(unique_tags[:3])
 
 def get_news(query):
+    """RSS-Suche für News-Updates"""
     encoded_query = query.replace(" ", "%20")
     url = f"https://news.google.com/rss/search?q={encoded_query}+Juve+LTO+Wirtschaft&hl=de&gl=DE&ceid=DE:de"
     feed = feedparser.parse(url)
     return feed.entries[:2]
 
 def fetch_contacts_from_db():
+    """Lädt alle Kontakte aus der Firebase Cloud"""
     if db is None: return pd.DataFrame()
-    docs = db.collection("kontakte").stream()
-    data = []
-    for doc in docs:
-        d = doc.to_dict()
-        d['Kontakt'] = doc.id
-        data.append(d)
-    return pd.DataFrame(data)
+    try:
+        docs = db.collection("kontakte").stream()
+        data = []
+        for doc in docs:
+            d = doc.to_dict()
+            d['Kontakt'] = doc.id
+            data.append(d)
+        return pd.DataFrame(data)
+    except Exception:
+        return pd.DataFrame()
 
 def save_contact_to_db(name, data_dict):
+    """Speichert oder aktualisiert einen Kontakt in Firebase"""
     if db:
         db.collection("kontakte").document(name).set(data_dict, merge=True)
 
 # --- HAUPT-PROGRAMM ---
 st.title("🧠 My Network Intelligence")
 
-# --- SIDEBAR: DATEN-UPLOAD ---
+# --- SIDEBAR: DATEN-IMPORT ---
 with st.sidebar:
     st.header("📂 Daten-Import")
+    st.write("Lade hier deine Export-Dateien hoch:")
     file_msg = st.file_uploader("LinkedIn messages.csv", type=['csv'])
     file_email = st.file_uploader("E-Mail Export (CSV)", type=['csv'])
     
-    if (file_msg or file_email) and st.button("In Cloud-Datenbank speichern"):
-        with st.spinner("Verarbeite Daten..."):
-            # Verarbeitung LinkedIn
+    if (file_msg or file_email) and st.button("Daten synchronisieren"):
+        with st.spinner("Verarbeite Daten und speichere in Cloud..."):
+            # 1. LinkedIn Verarbeitung
             if file_msg:
                 df_li = pd.read_csv(file_msg)
                 df_li['DATE'] = pd.to_datetime(df_li['DATE'], errors='coerce')
+                # Wer ist der Kontakt? (To, wenn From 'Vorbeck' ist, sonst From)
                 df_li['Kontakt'] = df_li.apply(lambda x: x['TO'] if 'Vorbeck' in str(x['FROM']) else x['FROM'], axis=1)
                 
-                for _, row in df_li.groupby('Kontakt'):
-                    name = str(row.name)
-                    if name != "nan":
-                        last_date = row['DATE'].max()
-                        content_sample = " ".join(row['CONTENT'].astype(str))
-                        save_contact_to_db(name, {
+                # Gruppierung nach Kontakt zur Extraktion des letzten Zeitpunkts
+                for contact_name, group in df_li.groupby('Kontakt'):
+                    name_str = str(contact_name)
+                    if name_str != "nan" and name_str != "None":
+                        last_date = group['DATE'].max()
+                        content_concat = " ".join(group['CONTENT'].astype(str))
+                        save_contact_to_db(name_str, {
                             "letzter_kontakt": last_date.strftime("%Y-%m-%d"),
-                            "tags": extract_tags(content_sample),
+                            "tags": extract_tags(content_concat),
                             "quelle": "LinkedIn"
                         })
-            st.success("Daten synchronisiert!")
-            st.rerun()
-
-# --- DASHBOARD ---
-df_db = fetch_contacts_from_db()
-
-if not df_db.empty:
-    df_db['letzter_kontakt'] = pd.to_datetime(df_db['letzter_kontakt'])
-    df_db['Tage vergangen'] = (datetime.datetime.now() - df_db['letzter_kontakt']).dt.days
-    
-    tab1, tab2, tab3 = st.tabs(["⏱️ Tracker", "🏷️ Memory", "📰 News Radar"])
-
-    with tab1:
-        st.subheader("Touchpoint Tracker")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("🔴 **Dringend (über 180 Tage)**")
-            st.dataframe(df_db[df_db['Tage vergangen'] > 180][['Kontakt', 'letzter_kontakt']].sort_values('letzter_kontakt'))
-        with col2:
-            st.write("🟢 **Kürzlich**")
-            st.dataframe(df_db[df_db['Tage vergangen'] <= 180][['Kontakt', 'letzter_kontakt']].sort_values('letzter_kontakt', ascending=False))
-
-    with tab2:
-        st.subheader("KI Memory Tags")
-        suche = st.text_input("Suchen:")
-        if suche:
-            res = df_db[df_db['Kontakt'].str.contains(suche, case=False, na=False)]
-            for _, r in res.iterrows():
-                st.info(f"**{r['Kontakt']}** | Tags: `{r.get('tags', 'keine')}`")
-
-    with tab3:
-        if st.button("Netzwerk scannen"):
-            for p in df_db['Kontakt'].tolist()[:5]:
-                news = get_news(p)
-                if news:
-                    st.write(f"**{p}:**")
-                    for n in news: st.write(f"- [{n.title}]({n.link})")
-else:
-    st.info("Datenbank leer. Bitte CSV hochladen.")
