@@ -1,120 +1,117 @@
 import streamlit as st
 import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
-import feedparser
 import datetime
+import feedparser
+from google.cloud import firestore
+from google.oauth2 import service_account
+import json
 
 # --- KONFIGURATION ---
-st.set_page_config(page_title="Network Intelligence", layout="wide", page_icon="🌐")
+st.set_page_config(page_title="Personal Intelligence", layout="wide", page_icon="🧠")
 
-# --- STYLE CSS (OPTIONAL) ---
-st.markdown("""
-    <style>
-    .big-font { font-size:20px !important; font-weight: bold; }
-    .stButton>button { width: 100%; border-radius: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
+# --- FIREBASE VERBINDUNG ---
+@st.cache_resource
+def get_db():
+    # Holt den Schlüssel sicher aus den Streamlit Secrets
+    key_dict = dict(st.secrets["firebase"])
+    creds = service_account.Credentials.from_service_account_info(key_dict)
+    db = firestore.Client(credentials=creds, project=key_dict["project_id"])
+    return db
 
-# --- FUNKTIONEN ---
+db = get_db()
 
+# --- HILFSFUNKTIONEN ---
 def get_news(query):
-    """Sucht echte News via Google News RSS Feed"""
     encoded_query = query.replace(" ", "%20")
     url = f"https://news.google.com/rss/search?q={encoded_query}+Juve+LTO+Wirtschaft&hl=de&gl=DE&ceid=DE:de"
     feed = feedparser.parse(url)
-    return feed.entries[:3] # Nur die top 3 News
+    return feed.entries[:2]
 
-def draw_network(contacts):
-    """Zeichnet das Beziehungsgeflecht"""
-    G = nx.Graph()
-    G.add_node("ICH", color='red', size=3000)
-    
-    # Knoten & Kanten aus Daten
-    for c in contacts:
-        G.add_node(c['Name'], color='skyblue', size=2000)
-        G.add_edge("ICH", c['Name'], weight=2)
-        if c['Firma']:
-            G.add_node(c['Firma'], color='gold', size=1500)
-            G.add_edge(c['Name'], c['Firma'], weight=1)
+def fetch_contacts_from_db():
+    """Holt alle Kontakte aus Firebase"""
+    kontakte_ref = db.collection("kontakte")
+    docs = kontakte_ref.stream()
+    data = []
+    for doc in docs:
+        d = doc.to_dict()
+        d['Kontakt'] = doc.id
+        data.append(d)
+    return pd.DataFrame(data)
 
-    # Hardcodierte Querverbindung zur Demo
-    if len(contacts) > 1:
-        G.add_edge(contacts[0]['Name'], contacts[1]['Firma'], weight=0.5, style='dashed')
-
-    pos = nx.spring_layout(G, k=0.8) # Layout berechnen
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    nx.draw(G, pos, with_labels=True, node_color='lightgrey', 
-            node_size=2500, font_size=10, font_weight='bold', edge_color='gray')
-    st.pyplot(fig)
+def save_contact_to_db(name, data_dict):
+    """Speichert einen Kontakt dauerhaft in Firebase"""
+    db.collection("kontakte").document(name).set(data_dict, merge=True)
 
 # --- HAUPT-PROGRAMM ---
+st.title("🧠 My Network Intelligence")
 
-st.title("🚀 Mein Personal CRM & Intelligence")
-
-# 1. SIDEBAR (STEUERUNG)
+# --- SIDEBAR: DATEN-UPLOAD ZU FIREBASE ---
 with st.sidebar:
-    st.header("🎛️ Steuerung")
-    st.write("Lade hier monatlich deine LinkedIn-Daten hoch.")
-    uploaded_file = st.file_uploader("Kontakt-Liste (CSV)", type=['csv'])
+    st.header("📂 Daten in die Cloud laden")
+    st.write("Lade hier deine Dateien hoch, um die Datenbank zu füllen.")
+    file_msg = st.file_uploader("LinkedIn messages.csv", type=['csv'])
     
-    # Dummy-Daten, falls nichts hochgeladen ist
-    if uploaded_file is None:
-        st.info("Demo-Modus aktiv (keine Datei hochgeladen)")
-        df = pd.DataFrame([
-            {"Name": "Jan Müller", "Firma": "Kanzlei X", "Position": "Partner", "Priorität": "Hoch"},
-            {"Name": "Thomas von Quadriga", "Firma": "Quadriga Capital", "Position": "MD", "Priorität": "Mittel"},
-            {"Name": "Steffi", "Firma": "Eigene Praxis", "Position": "Inhaberin", "Priorität": "Privat"}
-        ])
-    else:
-        df = pd.read_csv(uploaded_file)
-        st.success(f"{len(df)} Kontakte geladen!")
+    if file_msg:
+        with st.spinner("Speichere in Firebase..."):
+            df_li = pd.read_csv(file_msg)
+            if 'DATE' in df_li.columns and 'FROM' in df_li.columns:
+                df_li['DATE'] = pd.to_datetime(df_li['DATE'], errors='coerce')
+                # Kontakt identifizieren
+                df_li['Kontakt'] = df_li.apply(lambda x: x['TO'] if 'Vorbeck' in str(x['FROM']) else x['FROM'], axis=1)
+                
+                # Letztes Datum pro Kontakt finden
+                df_contacts = df_li.groupby('Kontakt')['DATE'].max().reset_index()
+                
+                # In Datenbank schreiben
+                for _, row in df_contacts.iterrows():
+                    kontakt_name = str(row['Kontakt'])
+                    if kontakt_name and kontakt_name != "nan":
+                        save_contact_to_db(kontakt_name, {
+                            "letzter_kontakt": row['DATE'].strftime("%Y-%m-%d"),
+                            "quelle": "LinkedIn"
+                        })
+            st.success("Erfolgreich in Firebase gespeichert! Du kannst die CSV jetzt löschen.")
 
-# 2. DASHBOARD TABS
-tab1, tab2, tab3 = st.tabs(["📊 Übersicht & News", "🕸️ Netzwerkanalyse", "📝 Notizen"])
+# --- DATEN AUS FIREBASE LADEN ---
+df_db = fetch_contacts_from_db()
 
-with tab1:
-    st.header("Dein tägliches Briefing")
+if not df_db.empty:
+    df_db['letzter_kontakt'] = pd.to_datetime(df_db['letzter_kontakt'])
+    df_db['Tage vergangen'] = (datetime.datetime.now() - df_db['letzter_kontakt']).dt.days
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Kontakte Total", len(df))
-    with col2:
-        st.metric("Dringende Follow-ups", "2", delta="-1")
+    tab1, tab2 = st.tabs(["⏱️ Touchpoint Tracker", "📰 News Radar"])
 
-    st.subheader("📰 Live News-Radar")
-    st.caption("Scannt Google News, Juve, LTO nach deinen Top-Kontakten")
-    
-    if st.button("Jetzt News scannen"):
-        with st.spinner('Scanne das Web...'):
-            found_news = False
-            for index, row in df.iterrows():
-                name = row['Name']
-                news_items = get_news(name)
-                if news_items:
-                    found_news = True
-                    with st.expander(f"Neuigkeiten zu: {name}", expanded=True):
-                        for item in news_items:
-                            st.write(f"**{item.title}**")
-                            st.write(f"LINK: {item.link}")
-                            st.caption(f"Quelle: {item.source.title} | {item.published}")
-            if not found_news:
-                st.warning("Keine aktuellen Nachrichten zu deinen Kontakten gefunden.")
+    with tab1:
+        st.header("Automated Touchpoint Tracker")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🔴 Dringend melden (> 180 Tage)")
+            df_urgent = df_db[df_db['Tage vergangen'] > 180].sort_values('Tage vergangen', ascending=False)
+            st.dataframe(df_urgent[['Kontakt', 'letzter_kontakt', 'Tage vergangen']].head(10), use_container_width=True)
+            
+        with col2:
+            st.subheader("🟢 Kürzlich in Kontakt")
+            df_recent = df_db[df_db['Tage vergangen'] <= 180].sort_values('Tage vergangen')
+            st.dataframe(df_recent[['Kontakt', 'letzter_kontakt', 'Tage vergangen']].head(10), use_container_width=True)
 
-with tab2:
-    st.header("Wer kennt wen?")
-    st.markdown("Diese Karte zeigt Verbindungen zwischen Personen und Firmen.")
-    draw_network(df.to_dict('records'))
-    st.info("Tipp: Die gestrichelte Linie zeigt eine indirekte Verbindung (Chance für Intro!)")
-
-with tab3:
-    st.header("Private Gesprächsnotizen")
-    selected_person = st.selectbox("Wähle Person", df['Name'])
-    
-    # Einfache Notiz-Logik (Achtung: Im Demo-Modus nicht dauerhaft gespeichert!)
-    note = st.text_area(f"Notiz zu {selected_person}", height=150, 
-                        placeholder="Z.B.: Hat Interesse an Immobilienrecht, Kinder heißen Max & Moritz...")
+    with tab2:
+        st.header("Fokussiertes News-Radar")
+        if st.button("Netzwerk nach News scannen"):
+            with st.spinner("Durchsuche Fachportale..."):
+                top_kontakte = df_db['Kontakt'].tolist()[:10]
+                gefunden = False
+                for person in top_kontakte:
+                    if person in ["LinkedIn Member", ""]: continue
+                    news = get_news(person)
+                    if news:
+                        gefunden = True
+                        st.markdown(f"### 📰 Treffer für: **{person}**")
+                        for item in news:
+                            st.write(f"- [{item.title}]({item.link})")
+                if not gefunden:
+                    st.success("Keine aktuellen Nachrichten zu deinen Kontakten.")
+else:
+    st.info("Deine Datenbank ist noch leer. Lade links eine messages.csv hoch, um sie zu füllen!")..")
     
     if st.button("Notiz speichern"):
         st.toast(f"Notiz für {selected_person} gespeichert!", icon="✅")
